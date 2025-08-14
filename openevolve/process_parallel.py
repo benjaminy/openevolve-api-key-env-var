@@ -158,69 +158,90 @@ def _run_iteration_worker(
         ]
         island_previous_programs = island_programs[: _worker_config.prompt.num_top_programs]
 
-        # Build prompt
-        prompt = _worker_prompt_sampler.build_prompt(
-            current_program=parent.code,
-            parent_program=parent.code,
-            program_metrics=parent.metrics,
-            previous_programs=[p.to_dict() for p in island_previous_programs],
-            top_programs=[p.to_dict() for p in island_top_programs],
-            inspirations=[p.to_dict() for p in inspirations],
-            language=_worker_config.language,
-            evolution_round=iteration,
-            diff_based_evolution=_worker_config.diff_based_evolution,
-            program_artifacts=parent_artifacts,
-        )
-
         iteration_start = time.time()
 
-        # Generate code modification (sync wrapper for async)
-        llm_response = asyncio.run(
-            _worker_llm_ensemble.generate_with_context(
-                system_message=prompt["system"],
-                messages=[{"role": "user", "content": prompt["user"]}],
-            )
-        )
-
-        # Parse response based on evolution mode
-        if _worker_config.diff_based_evolution:
-            from openevolve.utils.code_utils import extract_diffs, apply_diff, format_diff_summary
-
-            diff_blocks = extract_diffs(llm_response)
-            if not diff_blocks:
-                return SerializableResult(
-                    error=f"No valid diffs found in response", iteration=iteration
-                )
-
-            child_code = apply_diff(parent.code, llm_response)
-            changes_summary = format_diff_summary(diff_blocks)
-        else:
-            from openevolve.utils.code_utils import parse_full_rewrite
-
-            new_code = parse_full_rewrite(llm_response, _worker_config.language)
-            if not new_code:
-                return SerializableResult(
-                    error=f"No valid code found in response", iteration=iteration
-                )
-
-            child_code = new_code
-            changes_summary = "Full rewrite"
-
-        # Check code length
-        if len(child_code) > _worker_config.max_code_length:
-            return SerializableResult(
-                error=f"Generated code exceeds maximum length ({len(child_code)} > {_worker_config.max_code_length})",
-                iteration=iteration,
+        retry_count = 0
+        prompt_artifacts = dict( parent_artifacts ) if isinstance( parent_artifacts, dict ) else {}
+        while True:
+            # Build prompt
+            prompt = _worker_prompt_sampler.build_prompt(
+                current_program=parent.code,
+                parent_program=parent.code,
+                program_metrics=parent.metrics,
+                previous_programs=[p.to_dict() for p in island_previous_programs],
+                top_programs=[p.to_dict() for p in island_top_programs],
+                inspirations=[p.to_dict() for p in inspirations],
+                language=_worker_config.language,
+                evolution_round=iteration,
+                diff_based_evolution=_worker_config.diff_based_evolution,
+                program_artifacts=prompt_artifacts,
             )
 
-        # Evaluate the child program
-        import uuid
+            # Generate code modification (sync wrapper for async)
+            llm_response = asyncio.run(
+                _worker_llm_ensemble.generate_with_context(
+                    system_message=prompt["system"],
+                    messages=[{"role": "user", "content": prompt["user"]}],
+                )
+            )
 
-        child_id = str(uuid.uuid4())
-        child_metrics = asyncio.run(_worker_evaluator.evaluate_program(child_code, child_id))
+            # Parse response based on evolution mode
+            if _worker_config.diff_based_evolution:
+                from openevolve.utils.code_utils import extract_diffs, apply_diff, format_diff_summary
 
-        # Get artifacts
-        artifacts = _worker_evaluator.get_pending_artifacts(child_id)
+                diff_blocks = extract_diffs(llm_response)
+                if not diff_blocks:
+                    return SerializableResult(
+                        error=f"No valid diffs found in response", iteration=iteration
+                    )
+
+                child_code = apply_diff(parent.code, llm_response)
+                changes_summary = format_diff_summary(diff_blocks)
+            else:
+                from openevolve.utils.code_utils import parse_full_rewrite
+
+                new_code = parse_full_rewrite(llm_response, _worker_config.language)
+                if not new_code:
+                    return SerializableResult(
+                        error=f"No valid code found in response", iteration=iteration
+                    )
+
+                child_code = new_code
+                changes_summary = "Full rewrite"
+
+            # Check code length
+            if len(child_code) > _worker_config.max_code_length:
+                return SerializableResult(
+                    error=f"Generated code exceeds maximum length ({len(child_code)} > {_worker_config.max_code_length})",
+                    iteration=iteration,
+                )
+
+            # Evaluate the child program
+            import uuid
+
+            child_id = str(uuid.uuid4())
+            child_metrics = asyncio.run(_worker_evaluator.evaluate_program(child_code, child_id))
+
+            # Get artifacts
+            artifacts = _worker_evaluator.get_pending_artifacts(child_id)
+
+            retry_requested = (
+                artifacts.pop( "openevolve_uninteresting_failure_retry_requested", False )
+                if isinstance(artifacts, dict) else False )
+
+            if not retry_requested:
+                break
+
+            retry_count += 1
+            if retry_count > _worker_config.max_uninteresting_failure_retries:
+                logger.warning( f"Too many uninteresting failure retries {retry_count} {_worker_config.max_uninteresting_failure_retries}" )
+                break
+
+            for k, v in artifacts.items():
+                if k in prompt_artifacts:
+                    logger.info( f"Artifact collision. Maybe should merge? ({k} => {v} {prompt_artifacts[k]})" )
+
+                prompt_artifacts[ k ] = v
 
         # Create child program
         child_program = Program(

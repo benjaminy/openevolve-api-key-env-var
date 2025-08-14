@@ -254,6 +254,7 @@ class Config:
     # Evolution settings
     diff_based_evolution: bool = True
     max_code_length: int = 10000
+    max_uninteresting_failure_retries: int = 1
 
     @classmethod
     def from_yaml(cls, path: Union[str, Path]) -> "Config":
